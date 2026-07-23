@@ -1,0 +1,16 @@
+[package]
+name = "zola-tool"
+version = "0.1.0"
+edition = "2024"
+description = "TUI to manage posts of the Zola blog (list / create / rename / edit / delete)"
+
+[[bin]]
+name = "blog-tool"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+pulldown-cmark = { version = "0.12", default-features = false }
+
+[profile.release]
+opt-level = 2
