@@ -5,7 +5,7 @@ edition = "2024"
 description = "TUI to manage posts of the Zola blog (list / create / rename / edit / delete)"
 
 [[bin]]
-name = "blog-tool"
+name = "zola-tool"
 path = "src/main.rs"
 
 [dependencies]
