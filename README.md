@@ -17,6 +17,9 @@ on the markdown files in the site's `content/` directory.
   `nvim`/`vim`/`vi`/`nano`) — also available from within the preview.
 - **Publish / unpublish** — toggle a post's `draft` flag in place (the rest of
   the front matter and body are left untouched).
+- **Change date** — pick a post's `date` from an interactive month **calendar**
+  (arrows for day/week, PageUp/Down for month, `[`/`]` for year, `t` for today),
+  past or future; the list re-sorts accordingly.
 - **Delete** a post, behind a confirmation prompt.
 - **Serve** the site live with one key — starts `zola serve` in the background
   and opens `http://127.0.0.1:1111` in your browser. Press again to stop; it is
@@ -62,6 +65,7 @@ cargo run --release -- /path/to/blog/content # content dir directly
 | `⏎` / `v` | preview the selected post (rendered)      |
 | `e`       | edit the selected post in `$EDITOR`       |
 | `p`       | toggle draft / published                  |
+| `t`       | change the post's date (calendar picker)  |
 | `n`       | create a new draft post                   |
 | `r`       | rename the selected post's file           |
 | `d`       | delete the selected post (asks to confirm)|
@@ -81,6 +85,18 @@ cargo run --release -- /path/to/blog/content # content dir directly
 | `e`              | edit this post in `$EDITOR`   |
 | `q`/`Esc`/`⏎`    | back to the list              |
 
+### Date picker (calendar)
+
+| Key                | Action                        |
+|--------------------|-------------------------------|
+| `←`/`→`, `h`/`l`   | previous / next day           |
+| `↑`/`↓`, `k`/`j`   | previous / next week          |
+| `PgUp`/`PgDn`      | previous / next month         |
+| `[` / `]`          | previous / next year          |
+| `t`                | jump to today                 |
+| `⏎`                | apply the selected date       |
+| `q`/`Esc`          | cancel                        |
+
 ## Tests
 
 ```sh
@@ -88,8 +104,10 @@ cargo test
 ```
 
 Covers front-matter parsing/stripping, slug generation, the
-create/rename/delete filesystem operations, the draft-toggle front-matter edit,
-git repo detection / status classification / commit (in a throwaway repo), the
-markdown renderer (headings, lists, code blocks, HTML skipping, wrap counting),
-and headless rendering of each screen — including the preview — via ratatui's
-`TestBackend`.
+create/rename/delete filesystem operations, the draft-toggle and date
+front-matter edits, the calendar date arithmetic (parse/validate, add
+days/months/years with rollover and leap-day clamping, weekday), the date
+picker's navigate-and-apply flow, git repo detection / status classification /
+commit (in a throwaway repo), the markdown renderer (headings, lists, code
+blocks, HTML skipping, wrap counting), and headless rendering of each screen —
+including the preview and calendar — via ratatui's `TestBackend`.

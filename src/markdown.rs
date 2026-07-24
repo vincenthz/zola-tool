@@ -438,9 +438,10 @@ mod tests {
         let lines = render("# Title\n\nsome **bold** and *italic* text\n");
         let text = plain(&lines);
         assert!(text.iter().any(|l| l == "# Title"));
-        assert!(text
-            .iter()
-            .any(|l| l.contains("bold") && l.contains("italic")));
+        assert!(
+            text.iter()
+                .any(|l| l.contains("bold") && l.contains("italic"))
+        );
     }
 
     #[test]

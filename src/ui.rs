@@ -2,6 +2,7 @@
 //! clamps its scroll offset against the wrapped content height during draw.
 
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -9,10 +10,10 @@ use ratatui::{
         Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
         ScrollbarState, Table, TableState, Wrap,
     },
-    Frame,
 };
 
 use crate::app::{App, ConfirmAction, InputKind, Mode};
+use crate::date::{self, Date};
 use crate::git::GitState;
 use crate::markdown;
 
@@ -41,6 +42,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Input(_) => draw_input(frame, app),
         Mode::Confirm(_) => draw_confirm(frame, app),
+        Mode::DatePicker(_) => draw_datepicker(frame, app),
         Mode::Help => draw_help(frame),
         Mode::List | Mode::View(_) => {}
     }
@@ -237,6 +239,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" edit  "),
         key("p"),
         Span::raw(" pub  "),
+        key("t"),
+        Span::raw(" date  "),
         key("n"),
         Span::raw(" new  "),
         key("r"),
@@ -389,6 +393,98 @@ fn confirm_prompt(verb: &str) -> Line<'static> {
     ])
 }
 
+fn draw_datepicker(frame: &mut Frame, app: &App) {
+    let Mode::DatePicker(state) = &app.mode else {
+        return;
+    };
+    let area = centered_rect(52, 64, frame.area());
+    frame.render_widget(Clear, area);
+
+    let sel = state.date;
+    let today = Date::today();
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Headline: the selected date, then the month/year being viewed.
+    lines.push(Line::from(Span::styled(
+        format!("{} {}", date::weekday_short(sel.weekday()), sel.to_iso()),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("‹ {} {} ›", date::month_name(sel.month), sel.year),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    // Weekday header (Monday-first), aligned with the grid below it.
+    const WEEKDAYS: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+    let mut header = vec![Span::raw(" ")];
+    for wd in WEEKDAYS {
+        header.push(Span::styled(
+            format!("{wd} "),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines.push(Line::from(header));
+
+    // Grid: blanks up to the first weekday of the month, then each day.
+    let first_weekday = Date::new(sel.year, sel.month, 1)
+        .map(Date::weekday)
+        .unwrap_or(0);
+    let mut cells: Vec<Option<u32>> = vec![None; first_weekday as usize];
+    cells.extend((1..=sel.days_in_month()).map(Some));
+    while !cells.len().is_multiple_of(7) {
+        cells.push(None);
+    }
+    for week in cells.chunks(7) {
+        let mut spans = vec![Span::raw(" ")];
+        for cell in week {
+            match cell {
+                Some(d) => {
+                    let style = if *d == sel.day {
+                        Style::default()
+                            .bg(ACCENT)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else if today.year == sel.year && today.month == sel.month && *d == today.day
+                    {
+                        Style::default()
+                            .fg(ACCENT)
+                            .add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        Style::default()
+                    };
+                    spans.push(Span::styled(format!("{d:>2}"), style));
+                    spans.push(Span::raw(" "));
+                }
+                None => spans.push(Span::raw("   ")),
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "←→ day  ↑↓ week  PgUp/Dn month",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "[ ] year  t today  ⏎ set  Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(format!(" Set date · {} ", state.filename));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .block(block),
+        area,
+    );
+}
+
 fn draw_help(frame: &mut Frame) {
     let area = centered_rect(60, 60, frame.area());
     frame.render_widget(Clear, area);
@@ -400,6 +496,7 @@ fn draw_help(frame: &mut Frame) {
         ("⏎ / v", "preview post (rendered markdown)"),
         ("e", "edit post in $EDITOR"),
         ("p", "toggle draft / published"),
+        ("t", "change the post's date (calendar picker)"),
         ("n", "create a new draft post"),
         ("r", "rename the selected post's file"),
         ("d", "delete the selected post (asks to confirm)"),
@@ -457,7 +554,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::draw;
     use crate::app::{App, InputKind, InputState, Mode};
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn scratch_with_post() -> (std::path::PathBuf, App) {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -532,6 +629,25 @@ mod tests {
         let text = render(&mut app);
         assert!(text.contains("New post title"), "missing prompt");
         assert!(text.contains("Hello There"), "missing typed buffer");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn date_picker_renders_calendar() {
+        let (dir, mut app) = scratch_with_post();
+        app.handle_key(
+            ratatui::crossterm::event::KeyCode::Char('t'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        );
+        let text = render(&mut app);
+        assert!(text.contains("Set date"), "calendar title not shown");
+        assert!(
+            text.contains("Mo") && text.contains("Su"),
+            "weekday header not shown"
+        );
+        // The current month name should appear in the subtitle.
+        let month = crate::date::month_name(crate::date::Date::today().month);
+        assert!(text.contains(month), "month name {month} not shown");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

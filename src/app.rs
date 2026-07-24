@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
+use crate::date::Date;
 use crate::git::{self, GitState};
 use crate::post::{self, Post, Result};
 
@@ -57,12 +58,20 @@ pub struct ViewState {
     pub scroll: u16,
 }
 
+/// Calendar date-picker overlay state.
+pub struct DateState {
+    pub path: PathBuf,
+    pub filename: String,
+    pub date: Date,
+}
+
 /// Which screen / overlay is currently active.
 pub enum Mode {
     List,
     View(ViewState),
     Input(InputState),
     Confirm(ConfirmState),
+    DatePicker(DateState),
     Help,
 }
 
@@ -137,10 +146,10 @@ impl App {
             Ok(mut posts) => {
                 self.fill_git(&mut posts);
                 self.posts = posts;
-                if let Some(name) = keep {
-                    if let Some(idx) = self.posts.iter().position(|p| p.filename == name) {
-                        self.selected = idx;
-                    }
+                if let Some(name) = keep
+                    && let Some(idx) = self.posts.iter().position(|p| p.filename == name)
+                {
+                    self.selected = idx;
                 }
                 self.clamp_selection();
             }
@@ -173,11 +182,11 @@ impl App {
     /// Reap the server if it has exited on its own (e.g. port already in use),
     /// so the UI reflects reality. Call once per event-loop tick.
     pub fn poll_server(&mut self) {
-        if let Some(server) = &mut self.server {
-            if matches!(server.child.try_wait(), Ok(Some(_))) {
-                self.server = None;
-                self.status = "zola serve exited (see the terminal after quitting)".into();
-            }
+        if let Some(server) = &mut self.server
+            && matches!(server.child.try_wait(), Ok(Some(_)))
+        {
+            self.server = None;
+            self.status = "zola serve exited (see the terminal after quitting)".into();
         }
     }
 
@@ -251,10 +260,10 @@ impl App {
 
     /// Re-read the previewed post from disk (e.g. after editing it).
     pub fn refresh_view_body(&mut self) {
-        if let Mode::View(view) = &mut self.mode {
-            if let Ok(body) = post::read_body(&view.path) {
-                view.body = body;
-            }
+        if let Mode::View(view) = &mut self.mode
+            && let Ok(body) = post::read_body(&view.path)
+        {
+            view.body = body;
         }
     }
 
@@ -296,6 +305,66 @@ impl App {
             }
             Err(e) => self.status = format!("could not change draft state: {e}"),
         }
+    }
+
+    /// Open the calendar picker to change the selected post's date. Starts from
+    /// the post's current date (or today if it can't be parsed).
+    fn start_date_edit(&mut self) {
+        let Some(post) = self.selected_post() else {
+            self.status = "no post selected".into();
+            return;
+        };
+        let date = Date::parse(&post.date).unwrap_or_else(Date::today);
+        self.mode = Mode::DatePicker(DateState {
+            path: post.path.clone(),
+            filename: post.filename.clone(),
+            date,
+        });
+    }
+
+    fn handle_datepicker_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => return self.commit_date(),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::List;
+                self.status = "cancelled".into();
+                return;
+            }
+            _ => {}
+        }
+        let Mode::DatePicker(state) = &mut self.mode else {
+            return;
+        };
+        let d = state.date;
+        state.date = match code {
+            KeyCode::Left | KeyCode::Char('h') => d.add_days(-1),
+            KeyCode::Right | KeyCode::Char('l') => d.add_days(1),
+            KeyCode::Up | KeyCode::Char('k') => d.add_days(-7),
+            KeyCode::Down | KeyCode::Char('j') => d.add_days(7),
+            KeyCode::PageUp => d.add_months(-1),
+            KeyCode::PageDown => d.add_months(1),
+            KeyCode::Char('[') => d.add_years(-1),
+            KeyCode::Char(']') => d.add_years(1),
+            KeyCode::Char('t') | KeyCode::Char('T') => Date::today(),
+            _ => d,
+        };
+    }
+
+    fn commit_date(&mut self) {
+        let Mode::DatePicker(state) = &self.mode else {
+            return;
+        };
+        let path = state.path.clone();
+        let filename = state.filename.clone();
+        let iso = state.date.to_iso();
+        match post::set_date(&path, &iso) {
+            Ok(()) => {
+                self.reload(Some(&filename));
+                self.status = format!("{filename} date set to {iso}");
+            }
+            Err(e) => self.status = format!("could not set date: {e}"),
+        }
+        self.mode = Mode::List;
     }
 
     /// Open a commit-message prompt for the selected post (git repos only).
@@ -341,6 +410,7 @@ impl App {
             Mode::View(_) => self.handle_view_key(code),
             Mode::Input(_) => self.handle_input_key(code),
             Mode::Confirm(_) => self.handle_confirm_key(code),
+            Mode::DatePicker(_) => self.handle_datepicker_key(code),
             Mode::Help => self.mode = Mode::List,
         }
     }
@@ -421,6 +491,7 @@ impl App {
                 }
             }
             KeyCode::Char('p') => self.toggle_draft(),
+            KeyCode::Char('t') => self.start_date_edit(),
             KeyCode::Char('c') => self.start_commit(),
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('s') => self.toggle_server(),
@@ -580,7 +651,8 @@ fn open_in_browser(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::browser_command;
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
     #[test]
     fn browser_command_matches_platform() {
@@ -594,5 +666,64 @@ mod tests {
             "xdg-open"
         };
         assert_eq!(program, expected);
+    }
+
+    fn scratch_app() -> (PathBuf, App) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zola-tool-app-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        post::create(&dir, "Hello World").unwrap();
+        (dir.clone(), App::new(dir).unwrap())
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.handle_key(code, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn date_picker_navigates_and_sets_date() {
+        let (dir, mut app) = scratch_app();
+        // A freshly created post is dated today.
+        assert_eq!(app.selected_post().unwrap().date, Date::today().to_iso());
+
+        press(&mut app, 't'); // open the calendar
+        assert!(
+            matches!(app.mode, Mode::DatePicker(_)),
+            "picker should open"
+        );
+
+        // Right = +1 day, Down = +7 days -> +8 days from today.
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+
+        assert!(matches!(app.mode, Mode::List), "picker closes on confirm");
+        let expected = Date::today().add_days(8).to_iso();
+        assert_eq!(app.selected_post().unwrap().date, expected);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn date_picker_cancel_leaves_date_unchanged() {
+        let (dir, mut app) = scratch_app();
+        let before = app.selected_post().unwrap().date.clone();
+
+        press(&mut app, 't');
+        key(&mut app, KeyCode::PageDown); // move a month
+        key(&mut app, KeyCode::Esc); // ...then cancel
+
+        assert!(matches!(app.mode, Mode::List));
+        assert_eq!(app.selected_post().unwrap().date, before);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

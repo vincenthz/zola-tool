@@ -3,6 +3,7 @@
 //! delete posts in `content/`, and launch a live `zola serve` preview.
 
 mod app;
+mod date;
 mod git;
 mod markdown;
 mod post;
@@ -13,12 +14,12 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
     event::{self, Event, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::DefaultTerminal;
 
 use app::App;
 use post::Result;
@@ -54,12 +55,11 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         } else {
             true
         };
-        if event_ready {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key.code, key.modifiers);
-                }
-            }
+        if event_ready
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.handle_key(key.code, key.modifiers);
         }
 
         // Editing needs the terminal to itself, so it is deferred out of the

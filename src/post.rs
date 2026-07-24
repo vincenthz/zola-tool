@@ -3,8 +3,8 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::date::Date;
 use crate::git::GitState;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -242,11 +242,36 @@ pub fn delete(post: &Post) -> Result<()> {
 /// Set the `draft` flag in a post's front matter, editing only that field and
 /// leaving the rest of the file untouched. Inserts the field if absent.
 pub fn set_draft(path: &Path, draft: bool) -> Result<()> {
+    // Keep the flag just below the date (or title) when it has to be inserted.
+    edit_field(
+        path,
+        "draft",
+        &format!("draft = {draft}"),
+        &["date", "title"],
+    )
+}
+
+/// Set the `date` field (a Zola/TOML date literal, `YYYY-MM-DD`) in a post's
+/// front matter. The date may be in the past or the future.
+pub fn set_date(path: &Path, new_date: &str) -> Result<()> {
+    let date = new_date.trim();
+    if Date::parse(date).is_none() {
+        return Err(format!("invalid date '{date}' (expected YYYY-MM-DD)").into());
+    }
+    edit_field(path, "date", &format!("date = {date}"), &["title"])
+}
+
+/// Replace a top-level front-matter field with `line`, or insert `line` if the
+/// field is absent — placing it after the first present field named in
+/// `insert_after` (priority order), else right after the opening `+++`.
+///
+/// Only the front-matter block is touched, and only its top-level region before
+/// any `[table]` sub-section, so nested keys of the same name are never hit.
+fn edit_field(path: &Path, key: &str, line: &str, insert_after: &[&str]) -> Result<()> {
     let content = fs::read_to_string(path)?;
     let had_trailing_newline = content.ends_with('\n');
     let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
 
-    // Locate the `+++` front-matter block.
     let mut delims = lines
         .iter()
         .enumerate()
@@ -255,29 +280,23 @@ pub fn set_draft(path: &Path, draft: bool) -> Result<()> {
     let start = delims.next().ok_or("post has no front matter")?;
     let end = delims.next().ok_or("post front matter is not terminated")?;
 
-    // Only consider the top-level region, before any `[table]` sub-section.
     let region_end = ((start + 1)..end)
         .find(|&i| lines[i].trim_start().starts_with('['))
         .unwrap_or(end);
 
-    let value_line = format!("draft = {draft}");
-    if let Some(i) = (start + 1..region_end).find(|&i| field(lines[i].trim(), "draft").is_some()) {
-        lines[i] = value_line;
+    if let Some(i) = (start + 1..region_end).find(|&i| field(lines[i].trim(), key).is_some()) {
+        lines[i] = line.to_string();
     } else {
-        // Insert after `date`, else after `title`, else right after the opener.
-        let mut date_i = None;
-        let mut title_i = None;
-        for (i, line) in lines.iter().enumerate().take(region_end).skip(start + 1) {
-            let t = line.trim();
-            if field(t, "date").is_some() {
-                date_i = Some(i);
-            }
-            if field(t, "title").is_some() {
-                title_i = Some(i);
+        let mut at = start + 1;
+        'search: for name in insert_after {
+            for (i, l) in lines.iter().enumerate().take(region_end).skip(start + 1) {
+                if field(l.trim(), name).is_some() {
+                    at = i + 1;
+                    break 'search;
+                }
             }
         }
-        let at = date_i.or(title_i).map(|i| i + 1).unwrap_or(start + 1);
-        lines.insert(at, value_line);
+        lines.insert(at, line.to_string());
     }
 
     let mut out = lines.join("\n");
@@ -315,31 +334,9 @@ fn strip_front_matter(content: &str) -> &str {
     content
 }
 
-/// Today's date as `YYYY-MM-DD` (UTC), without pulling in a date crate.
+/// Today's date as `YYYY-MM-DD` (UTC).
 fn today() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    let days = secs.div_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// Convert a count of days since the Unix epoch into a civil (year, month, day)
-/// using Howard Hinnant's `civil_from_days` algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    Date::today().to_iso()
 }
 
 #[cfg(test)]
@@ -370,13 +367,6 @@ mod tests {
         );
         assert_eq!(slugify("  weird---spacing  "), "weird-spacing");
         assert_eq!(slugify("!!!"), "");
-    }
-
-    #[test]
-    fn civil_date_is_correct() {
-        // 2020-01-26 is 18287 days after the epoch.
-        assert_eq!(civil_from_days(18_287), (2020, 1, 26));
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
     }
 
     #[test]
@@ -470,6 +460,47 @@ mod tests {
 
         set_draft(&path, true).unwrap();
         assert!(parse_post(&path).unwrap().draft);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_date_changes_field_when_valid() {
+        let dir = scratch();
+        let path = dir.join("p.md");
+        fs::write(
+            &path,
+            "+++\ntitle = \"x\"\ndate = 2020-01-01\ndraft = false\n+++\n\nbody\n",
+        )
+        .unwrap();
+
+        set_date(&path, "2031-07-04").unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("date = 2031-07-04"));
+        assert!(!after.contains("2020-01-01"));
+        assert_eq!(parse_post(&path).unwrap().date, "2031-07-04");
+        // Other fields and body untouched.
+        assert!(after.contains("draft = false"));
+        assert!(after.ends_with("body\n"));
+
+        // Invalid date is rejected and the file is left unchanged.
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(set_date(&path, "2031-02-30").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_date_inserts_after_title_when_missing() {
+        let dir = scratch();
+        let path = dir.join("p.md");
+        fs::write(&path, "+++\ntitle = \"x\"\n+++\n\nbody\n").unwrap();
+        set_date(&path, "2025-05-05").unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        let title_pos = after.find("title =").unwrap();
+        let date_pos = after.find("date = 2025-05-05").unwrap();
+        assert!(title_pos < date_pos);
+        assert_eq!(parse_post(&path).unwrap().date, "2025-05-05");
         fs::remove_dir_all(&dir).unwrap();
     }
 
