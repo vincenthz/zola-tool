@@ -9,8 +9,8 @@ name = "zola-tool"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
-pulldown-cmark = { version = "0.12", default-features = false }
+ratatui = "0.30"
+pulldown-cmark = { version = "0.13", default-features = false }
 
 [profile.release]
 opt-level = 2
