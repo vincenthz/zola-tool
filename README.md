@@ -32,6 +32,13 @@ on the markdown files in the site's `content/` directory.
     post's state — "add post: …" for a new file, "update post: …" otherwise);
   - **deploy** by pushing commits to the remote (behind a confirmation).
 
+- **Writing assistant** (optional, see [below](#writing-assistant-biv)): a
+  local language model, run by [biv](https://github.com/vincenthz/biv),
+  **reviews** a post, drafts a **plan** (outline) for it from its title and
+  notes, or drafts the **post** itself. The answer streams into a scrollable
+  pane; a plan can then be appended to the post, and a draft can replace its
+  body (after a confirmation if the body has text in it).
+
 Section indexes (`_index.md`) and non-markdown files are never touched.
 
 Requires [`zola`](https://www.getzola.org/) on your `PATH` for the serve
@@ -53,6 +60,46 @@ cargo run --release -- /path/to/blog        # blog root
 cargo run --release -- /path/to/blog/content # content dir directly
 ```
 
+## Writing assistant (biv)
+
+The assistant is a cargo feature, off by default. It pulls the
+[biv](https://github.com/vincenthz/biv) inference engine from GitHub (pure
+Rust, Metal on macOS, CPU elsewhere; Rust 1.98 or later):
+
+```sh
+cargo run --release --features biv
+```
+
+Press `a` on a post, then:
+
+| Key | Action | Result |
+|-----|--------|--------|
+| `r` | **Review**: feedback on the post (summary, strengths, issues, line edits) | shown only |
+| `p` | **Plan**: an outline from the title and the notes in the post | `a` appends it under `## Plan` |
+| `d` | **Draft**: the whole body, from the title and the notes or plan | `a` replaces the body (front matter kept) |
+
+The post is read from disk when the request starts, so notes typed in
+`$EDITOR`, or a plan appended before, are what the model works from. Each
+request is one independent turn; `r` in the pane regenerates.
+
+The model is loaded the first time it is used, and stays loaded until the tool
+exits. It is looked up in the Hugging Face cache (`$HF_HUB_CACHE`,
+`$HF_HOME/hub`, `~/.cache/huggingface/hub`); biv does not download, so get it
+first:
+
+```sh
+hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-Q4_1.gguf   # the default, 17.5 GB
+```
+
+| Variable | Effect |
+|----------|--------|
+| `ZOLA_TOOL_BIV_MODEL` | another `hf.co/<owner>/<repo>:<quant>` name, or a `.gguf` path (e.g. `hf.co/unsloth/Qwen3.5-4B-GGUF:Q8_0`, faster and lighter) |
+| `ZOLA_TOOL_BIV_CPU=1` | run on the CPU even where Metal is available |
+| `ZOLA_TOOL_BIV_THINK=1` | let the model reason before answering (slower, sometimes better) |
+
+On an M2 Max, the default model loads in a few seconds and writes about 25
+tokens/s: a plan takes about 30 s, a full draft a minute or two.
+
 ## Keys
 
 ### Post list
@@ -72,6 +119,7 @@ cargo run --release -- /path/to/blog/content # content dir directly
 | `c`       | commit the selected post (git repos only) |
 | `P`       | deploy: push commits to remote (git only) |
 | `s`       | start/stop `zola serve` + open in browser |
+| `a`       | assistant: review / plan / draft (biv)    |
 | `?`       | toggle help                               |
 | `q`/`Esc` | quit                                      |
 
@@ -84,6 +132,17 @@ cargo run --release -- /path/to/blog/content # content dir directly
 | `g` / `G`        | jump to top / bottom          |
 | `e`              | edit this post in `$EDITOR`   |
 | `q`/`Esc`/`⏎`    | back to the list              |
+
+### Assistant pane (biv)
+
+| Key              | Action                                         |
+|------------------|------------------------------------------------|
+| `↑`/`↓`, `k`/`j` | scroll (follows the end while it writes)       |
+| `PgUp`/`PgDn`    | scroll one page                                |
+| `g` / `G`        | jump to top / bottom (and follow again)        |
+| `a`              | apply: append the plan / replace the body      |
+| `r`              | regenerate                                     |
+| `q`/`Esc`        | cancel the request, or back to the list        |
 
 ### Date picker (calendar)
 
@@ -110,4 +169,12 @@ days/months/years with rollover and leap-day clamping, weekday), the date
 picker's navigate-and-apply flow, git repo detection / status classification /
 commit (in a throwaway repo), the markdown renderer (headings, lists, code
 blocks, HTML skipping, wrap counting), and headless rendering of each screen —
-including the preview and calendar — via ratatui's `TestBackend`.
+including the preview and calendar — via ratatui's `TestBackend`, and the
+assistant's prompts, output cleaning, apply-to-post edits and screen flow (with
+simulated model updates, so no model is needed).
+
+```sh
+cargo test --features biv                       # also the biv worker (no model)
+ZOLA_TOOL_BIV_MODEL=hf.co/unsloth/Qwen3.5-4B-GGUF:Q8_0 \
+  cargo test --release --features biv -- --ignored --nocapture   # with a real model
+```

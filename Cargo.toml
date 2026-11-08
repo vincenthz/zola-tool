@@ -8,9 +8,25 @@ description = "TUI to manage posts of the Zola blog (list / create / rename / ed
 name = "zola-tool"
 path = "src/main.rs"
 
+[features]
+# A local writing assistant (review / plan / draft a post) running the biv
+# inference engine. Off by default: `cargo build --release --features biv`.
+biv = ["dep:biv", "dep:biv-cli", "dep:rayon"]
+
 [dependencies]
 ratatui = "0.30"
 pulldown-cmark = { version = "0.13", default-features = false }
+# the inference engine, and its GGUF / Hugging Face cache helpers
+biv = { git = "https://github.com/vincenthz/biv", optional = true }
+biv-cli = { git = "https://github.com/vincenthz/biv", optional = true }
+rayon = { version = "1.12", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+biv = { git = "https://github.com/vincenthz/biv", optional = true, features = ["metal"] }
+
+[profile.dev.package."*"]
+# unoptimized quantized kernels make inference unusably slow in debug builds
+opt-level = 3
 
 [profile.release]
 opt-level = 2

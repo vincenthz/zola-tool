@@ -12,7 +12,8 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, ConfirmAction, InputKind, Mode};
+use crate::app::{App, AssistPhase, ConfirmAction, InputKind, Mode};
+use crate::assist;
 use crate::date::{self, Date};
 use crate::git::GitState;
 use crate::markdown;
@@ -20,9 +21,13 @@ use crate::markdown;
 const ACCENT: Color = Color::Cyan;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    // The markdown preview is a full-screen mode of its own.
+    // The markdown preview and the assistant are full-screen modes of their own.
     if matches!(app.mode, Mode::View(_)) {
         draw_view(frame, app);
+        return;
+    }
+    if matches!(app.mode, Mode::Assist(_)) {
+        draw_assist(frame, app);
         return;
     }
 
@@ -43,8 +48,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Input(_) => draw_input(frame, app),
         Mode::Confirm(_) => draw_confirm(frame, app),
         Mode::DatePicker(_) => draw_datepicker(frame, app),
+        Mode::AssistMenu => draw_assist_menu(frame, app),
         Mode::Help => draw_help(frame),
-        Mode::List | Mode::View(_) => {}
+        Mode::List | Mode::View(_) | Mode::Assist(_) => {}
     }
 }
 
@@ -63,19 +69,14 @@ fn draw_view(frame: &mut Frame, app: &mut App) {
         .split(frame.area());
 
     let lines = markdown::render(&view.body);
-
-    let inner_w = chunks[1].width.saturating_sub(2);
-    let inner_h = chunks[1].height.saturating_sub(2);
-    let total = markdown::visual_row_count(&lines, inner_w);
-    let max_scroll = total.saturating_sub(inner_h);
-    if view.scroll > max_scroll {
-        view.scroll = max_scroll;
-    }
-    let percent = if max_scroll == 0 {
-        100
-    } else {
-        (view.scroll as u32 * 100 / max_scroll as u32) as u16
-    };
+    let percent = draw_scrolled(
+        frame,
+        chunks[1],
+        lines,
+        &mut view.scroll,
+        false,
+        Block::default().borders(Borders::ALL).title(" Preview "),
+    );
 
     // Header: title + filename + scroll position.
     let header = Line::from(vec![
@@ -95,25 +96,6 @@ fn draw_view(frame: &mut Frame, app: &mut App) {
         .title_alignment(Alignment::Right);
     frame.render_widget(Paragraph::new(header).block(header_block), chunks[0]);
 
-    // Body.
-    let body = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Preview "))
-        .wrap(Wrap { trim: false })
-        .scroll((view.scroll, 0));
-    frame.render_widget(body, chunks[1]);
-
-    // Scrollbar on the body's right edge.
-    let mut sb_state = ScrollbarState::new(total as usize)
-        .viewport_content_length(inner_h as usize)
-        .position(view.scroll as usize);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("↑"))
-            .end_symbol(Some("↓")),
-        chunks[1],
-        &mut sb_state,
-    );
-
     // Footer.
     let keys = Line::from(vec![
         key("↑/↓"),
@@ -130,6 +112,235 @@ fn draw_view(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(keys).block(Block::default().borders(Borders::ALL)),
         chunks[2],
+    );
+}
+
+/// Render `lines` wrapped in `block` over `area`, scrolled by `scroll`
+/// (clamped to the end, or kept at it when `follow`), with a scrollbar.
+/// Returns how far down the text is shown, in percent.
+fn draw_scrolled(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    scroll: &mut u16,
+    follow: bool,
+    block: Block,
+) -> u16 {
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
+    let total = markdown::visual_row_count(&lines, inner_w);
+    let max_scroll = total.saturating_sub(inner_h);
+    if follow || *scroll > max_scroll {
+        *scroll = max_scroll;
+    }
+    let percent = if max_scroll == 0 {
+        100
+    } else {
+        (*scroll as u32 * 100 / max_scroll as u32) as u16
+    };
+
+    let body = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((*scroll, 0));
+    frame.render_widget(body, area);
+
+    // Scrollbar on the body's right edge.
+    let mut sb_state = ScrollbarState::new(total as usize)
+        .viewport_content_length(inner_h as usize)
+        .position(*scroll as usize);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓")),
+        area,
+        &mut sb_state,
+    );
+    percent
+}
+
+/// The assistant's screen: its answer streaming in, rendered as markdown.
+fn draw_assist(frame: &mut Frame, app: &mut App) {
+    let model = app.model_info.clone();
+    let status = app.status.clone();
+    let Mode::Assist(state) = &mut app.mode else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // header
+            Constraint::Min(1),    // answer
+            Constraint::Length(4), // footer (keys + status)
+        ])
+        .split(frame.area());
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let (phase, phase_style) = match &state.phase {
+        AssistPhase::Waiting(what) => (what.clone(), Style::default().fg(Color::Yellow)),
+        AssistPhase::Thinking => ("thinking…".to_string(), Style::default().fg(Color::Yellow)),
+        AssistPhase::Writing => ("writing…".to_string(), Style::default().fg(Color::Yellow)),
+        AssistPhase::Done(summary) => (
+            format!("done — {summary}"),
+            Style::default().fg(Color::Green),
+        ),
+        AssistPhase::Failed(error) => (format!("failed: {error}"), Style::default().fg(Color::Red)),
+    };
+
+    // Body: the answer, else the reasoning while there is no answer yet.
+    let mut lines = if !state.answer.is_empty() {
+        markdown::render(&state.answer)
+    } else if !state.thinking.is_empty() {
+        state
+            .thinking
+            .lines()
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.to_string(),
+                    dim.add_modifier(Modifier::ITALIC),
+                ))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if let AssistPhase::Failed(error) = &state.phase {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {error}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    let title = match &model {
+        Some(model) => format!(" {} · {model} ", state.action.label()),
+        None => format!(" {} ", state.action.label()),
+    };
+    let follow = state.follow && state.running();
+    let percent = draw_scrolled(
+        frame,
+        chunks[1],
+        lines,
+        &mut state.scroll,
+        follow,
+        Block::default().borders(Borders::ALL).title(title),
+    );
+
+    let header = Line::from(vec![
+        Span::styled(
+            format!(" ✨ {} ", state.title),
+            Style::default().fg(ACCENT).bold(),
+        ),
+        Span::styled(format!("· {} ", state.filename), dim),
+    ]);
+    let header_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(format!(" {percent}% "))
+        .title_alignment(Alignment::Right);
+    frame.render_widget(Paragraph::new(header).block(header_block), chunks[0]);
+
+    // Footer: the keys for this phase, then the phase (or the confirmation).
+    let mut spans = vec![
+        key("↑/↓"),
+        Span::raw(" scroll  "),
+        key("g/G"),
+        Span::raw(" top/end  "),
+    ];
+    if state.running() {
+        spans.extend([key("q/Esc"), Span::raw(" cancel")]);
+    } else {
+        if state.action.applies() && matches!(state.phase, AssistPhase::Done(_)) {
+            let apply = match state.action {
+                assist::Action::Plan => " append to post  ",
+                _ => " replace post body  ",
+            };
+            spans.extend([key("a"), Span::raw(apply)]);
+        }
+        spans.extend([
+            key("r"),
+            Span::raw(" regenerate  "),
+            key("q/Esc"),
+            Span::raw(" back"),
+        ]);
+    }
+    let second = if state.confirm_replace {
+        Line::from(vec![
+            Span::styled(
+                format!(" Replace the body of {} with this draft? ", state.filename),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" replace  any other key keeps it"),
+        ])
+    } else if !state.running() && !status.is_empty() {
+        // e.g. why writing the result failed
+        Line::from(vec![
+            Span::styled(format!(" {phase}  "), phase_style),
+            Span::styled(status, Style::default().fg(Color::Green)),
+        ])
+    } else {
+        Line::from(Span::styled(format!(" {phase}"), phase_style))
+    };
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(spans), second])
+            .block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
+}
+
+/// The choice of what the assistant does with the selected post.
+fn draw_assist_menu(frame: &mut Frame, app: &App) {
+    let area = centered_rect(60, 40, frame.area());
+    frame.render_widget(Clear, area);
+    let title = app.selected_post().map(|p| p.title.as_str()).unwrap_or("");
+    let dim = Style::default().fg(Color::DarkGray);
+    let choice = |k: &'static str, name: &'static str, what: &'static str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {k}  "),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{name:<8}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(what, dim),
+        ])
+    };
+    let model = match &app.model_info {
+        Some(model) => model.clone(),
+        None => "the model is loaded on first use (this can take a while)".into(),
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        choice("r", "Review", "feedback on the post as it is"),
+        choice("p", "Plan", "an outline, from the title and your notes"),
+        choice("d", "Draft", "the whole post, from your notes or plan"),
+        Line::from(""),
+        Line::from(Span::styled(model, dim)),
+        Line::from(Span::styled("Esc cancel", dim)),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" Assistant (biv) ");
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
     );
 }
 
@@ -255,6 +466,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             key("P"),
             Span::raw(" deploy  "),
         ]);
+    }
+    if assist::AVAILABLE {
+        spans.extend([key("a"), Span::raw(" assist  ")]);
     }
     spans.extend([
         key("s"),
@@ -486,10 +700,10 @@ fn draw_datepicker(frame: &mut Frame, app: &App) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let area = centered_rect(60, 60, frame.area());
+    let area = centered_rect(60, 75, frame.area());
     frame.render_widget(Clear, area);
 
-    let rows = [
+    let mut rows = vec![
         ("↑ / k", "move selection up"),
         ("↓ / j", "move selection down"),
         ("g / G", "jump to first / last"),
@@ -506,6 +720,12 @@ fn draw_help(frame: &mut Frame) {
         ("?", "toggle this help"),
         ("q / Esc", "quit"),
     ];
+    if assist::AVAILABLE {
+        rows.insert(
+            rows.len() - 2,
+            ("a", "assistant: review / plan / draft the post"),
+        );
+    }
     let mut lines = vec![Line::from(Span::styled(
         "Keybindings",
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -583,6 +803,51 @@ mod tests {
             }
         }
         text
+    }
+
+    #[test]
+    fn assist_screen_renders_answer_and_apply_key() {
+        use crate::app::{AssistPhase, AssistState};
+        use crate::assist::Action;
+        let (dir, mut app) = scratch_with_post();
+        let post = app.selected_post().unwrap().clone();
+        app.model_info = Some("Qwen3.8 27B, Metal".into());
+        app.mode = Mode::Assist(AssistState {
+            action: Action::Plan,
+            title: post.title,
+            filename: post.filename,
+            path: post.path,
+            id: 1,
+            phase: AssistPhase::Done("42 tokens".into()),
+            thinking: String::new(),
+            answer: "- **Why** mix the two\n- FFI basics".into(),
+            scroll: 0,
+            follow: true,
+            confirm_replace: false,
+        });
+        let text = render(&mut app);
+        assert!(text.contains("Combining Rust and Haskell"), "missing title");
+        assert!(text.contains("Plan · Qwen3.8 27B, Metal"), "missing model");
+        assert!(text.contains("Why mix the two"), "missing rendered answer");
+        assert!(text.contains("append to post"), "missing apply key");
+        assert!(text.contains("done — 42 tokens"), "missing summary");
+
+        if let Mode::Assist(state) = &mut app.mode {
+            state.confirm_replace = true;
+        }
+        assert!(render(&mut app).contains("Replace the body of"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn assist_menu_lists_the_actions() {
+        let (dir, mut app) = scratch_with_post();
+        app.mode = Mode::AssistMenu;
+        let text = render(&mut app);
+        for word in ["Review", "Plan", "Draft", "loaded on first use"] {
+            assert!(text.contains(word), "missing {word}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

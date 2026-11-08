@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
+use crate::assist::{self, Action, Assistant, Update};
 use crate::date::Date;
 use crate::git::{self, GitState};
 use crate::post::{self, Post, Result};
@@ -65,6 +66,45 @@ pub struct DateState {
     pub date: Date,
 }
 
+/// Where an assistant request is at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssistPhase {
+    /// Before any text: the model loading, the post being read.
+    Waiting(String),
+    Thinking,
+    Writing,
+    /// Finished, with a summary (tokens, time).
+    Done(String),
+    Failed(String),
+}
+
+/// Assistant screen state: one request about one post, and its answer.
+pub struct AssistState {
+    pub action: Action,
+    pub title: String,
+    pub filename: String,
+    pub path: PathBuf,
+    /// The request's id, to match the model's updates.
+    pub id: u64,
+    pub phase: AssistPhase,
+    pub thinking: String,
+    pub answer: String,
+    pub scroll: u16,
+    /// Keep the end of the text in view as it grows.
+    pub follow: bool,
+    /// Asking to confirm a draft replacing the post's body.
+    pub confirm_replace: bool,
+}
+
+impl AssistState {
+    pub fn running(&self) -> bool {
+        matches!(
+            self.phase,
+            AssistPhase::Waiting(_) | AssistPhase::Thinking | AssistPhase::Writing
+        )
+    }
+}
+
 /// Which screen / overlay is currently active.
 pub enum Mode {
     List,
@@ -72,6 +112,9 @@ pub enum Mode {
     Input(InputState),
     Confirm(ConfirmState),
     DatePicker(DateState),
+    /// Choosing what the assistant should do with the selected post.
+    AssistMenu,
+    Assist(AssistState),
     Help,
 }
 
@@ -89,6 +132,10 @@ pub struct App {
     server: Option<Server>,
     /// The git repository root, if the blog is under version control.
     git_repo: Option<PathBuf>,
+    /// The writing assistant; its model is loaded by the first request.
+    assistant: Assistant,
+    /// The assistant's model and engine, once loaded.
+    pub model_info: Option<String>,
 }
 
 impl App {
@@ -106,6 +153,8 @@ impl App {
             pending_edit: None,
             server: None,
             git_repo,
+            assistant: Assistant::default(),
+            model_info: None,
         };
         app.fill_git(&mut posts);
         app.posts = posts;
@@ -238,8 +287,12 @@ impl App {
         Ok(url)
     }
 
-    /// Stop the preview server if running. Call on exit so it does not linger.
+    /// Stop the preview server if running, and the assistant's request. Call on
+    /// exit so nothing lingers.
     pub fn shutdown(&mut self) {
+        if let Mode::Assist(state) = &self.mode {
+            self.assistant.cancel(state.id);
+        }
         if let Some(mut server) = self.server.take() {
             let _ = server.child.kill();
             let _ = server.child.wait();
@@ -403,6 +456,228 @@ impl App {
         });
     }
 
+    /// Is the assistant working on the request on screen? The main loop then
+    /// wakes often to show its progress.
+    pub fn is_assisting(&self) -> bool {
+        matches!(&self.mode, Mode::Assist(state) if state.running())
+    }
+
+    fn open_assist_menu(&mut self) {
+        if !assist::AVAILABLE {
+            self.status =
+                "the assistant needs a build with biv: cargo build --release --features biv".into();
+        } else if self.selected_post().is_none() {
+            self.status = "no post selected".into();
+        } else {
+            self.mode = Mode::AssistMenu;
+        }
+    }
+
+    fn handle_assist_menu_key(&mut self, code: KeyCode) {
+        let action = match code {
+            KeyCode::Char('r') => Action::Review,
+            KeyCode::Char('p') => Action::Plan,
+            KeyCode::Char('d') => Action::Draft,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::List;
+                self.status = "cancelled".into();
+                return;
+            }
+            _ => return,
+        };
+        let Some(post) = self.selected_post().cloned() else {
+            self.mode = Mode::List;
+            return;
+        };
+        self.start_assist(action, post.title, post.filename, post.path);
+    }
+
+    /// Send the post as it is on disk to the assistant, and show its answer.
+    fn start_assist(&mut self, action: Action, title: String, filename: String, path: PathBuf) {
+        let body = match post::read_body(&path) {
+            Ok(body) => body,
+            Err(e) => {
+                self.mode = Mode::List;
+                self.status = format!("open failed: {e}");
+                return;
+            }
+        };
+        if action == Action::Review && !assist::has_content(&body) {
+            self.mode = Mode::List;
+            self.status =
+                format!("{filename} is empty: nothing to review yet (try a plan or a draft)");
+            return;
+        }
+        match self.assistant.start(action, &title, &body) {
+            Ok(id) => {
+                // the screen's status line is about this request from now on
+                self.status.clear();
+                let waiting = match &self.model_info {
+                    Some(_) => "reading the post…".to_string(),
+                    None => "starting the model…".to_string(),
+                };
+                self.mode = Mode::Assist(AssistState {
+                    action,
+                    title,
+                    filename,
+                    path,
+                    id,
+                    phase: AssistPhase::Waiting(waiting),
+                    thinking: String::new(),
+                    answer: String::new(),
+                    scroll: 0,
+                    follow: true,
+                    confirm_replace: false,
+                });
+            }
+            Err(e) => {
+                self.mode = Mode::List;
+                self.status = format!("assistant: {e}");
+            }
+        }
+    }
+
+    /// Take in what the model reported since the last tick. Call once per
+    /// event-loop tick.
+    pub fn poll_assist(&mut self) {
+        for update in self.assistant.poll() {
+            self.apply_update(update);
+        }
+    }
+
+    fn apply_update(&mut self, update: Update) {
+        if let Update::Loaded(info) = update {
+            self.model_info = Some(info);
+            return;
+        }
+        // updates about a request that is no longer on screen are dropped
+        let Mode::Assist(state) = &mut self.mode else {
+            return;
+        };
+        match update {
+            Update::Loaded(_) => {}
+            Update::Waiting { id, what } if id == state.id => {
+                state.phase = AssistPhase::Waiting(what);
+            }
+            Update::Progress {
+                id,
+                thinking,
+                answer,
+            } if id == state.id => {
+                state.phase = if answer.is_empty() {
+                    AssistPhase::Thinking
+                } else {
+                    AssistPhase::Writing
+                };
+                state.thinking = thinking;
+                state.answer = answer;
+            }
+            Update::Done {
+                id,
+                answer,
+                summary,
+            } if id == state.id => {
+                state.answer = answer;
+                state.phase = AssistPhase::Done(summary);
+            }
+            Update::Failed { id, error } if id == state.id => {
+                state.phase = AssistPhase::Failed(error);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_assist_key(&mut self, code: KeyCode) {
+        let Mode::Assist(state) = &mut self.mode else {
+            return;
+        };
+        if state.confirm_replace {
+            state.confirm_replace = false;
+            if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.apply_assist();
+            } else {
+                self.status = "kept the post as it is".into();
+            }
+            return;
+        }
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if state.running() {
+                    self.assistant.cancel(state.id);
+                    self.status = format!("{} cancelled", state.action.label().to_lowercase());
+                }
+                self.mode = Mode::List;
+            }
+            KeyCode::Down | KeyCode::Char('j') => state.scroll = state.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.follow = false;
+                state.scroll = state.scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                state.scroll = state.scroll.saturating_add(PAGE_STEP)
+            }
+            KeyCode::PageUp => {
+                state.follow = false;
+                state.scroll = state.scroll.saturating_sub(PAGE_STEP);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                state.follow = false;
+                state.scroll = 0;
+            }
+            // The exact bottom is clamped against the wrapped height at render.
+            KeyCode::End | KeyCode::Char('G') => {
+                state.follow = true;
+                state.scroll = u16::MAX;
+            }
+            KeyCode::Char('r') if !state.running() => {
+                let (action, title, filename, path) = (
+                    state.action,
+                    state.title.clone(),
+                    state.filename.clone(),
+                    state.path.clone(),
+                );
+                self.start_assist(action, title, filename, path);
+            }
+            KeyCode::Char('a')
+                if state.action.applies() && matches!(state.phase, AssistPhase::Done(_)) =>
+            {
+                // a draft replaces the body: ask first unless there is nothing to lose
+                let has_body = post::read_body(&state.path).is_ok_and(|b| assist::has_content(&b));
+                if state.action == Action::Draft && has_body {
+                    state.confirm_replace = true;
+                } else {
+                    self.apply_assist();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Write the finished plan or draft into its post, and go back to the list.
+    fn apply_assist(&mut self) {
+        let Mode::Assist(state) = &self.mode else {
+            return;
+        };
+        let text = assist::clean_output(&state.answer);
+        let filename = state.filename.clone();
+        let (result, done) = match state.action {
+            Action::Plan => (
+                post::append_to_body(&state.path, &format!("## Plan\n\n{text}")),
+                "plan appended to",
+            ),
+            Action::Draft => (post::replace_body(&state.path, &text), "draft written to"),
+            Action::Review => return,
+        };
+        match result {
+            Ok(()) => {
+                self.reload(Some(&filename));
+                self.status = format!("{done} {filename}");
+                self.mode = Mode::List;
+            }
+            Err(e) => self.status = format!("could not write {filename}: {e}"),
+        }
+    }
+
     /// Route a key press to the handler for the current mode.
     pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         match &self.mode {
@@ -411,6 +686,8 @@ impl App {
             Mode::Input(_) => self.handle_input_key(code),
             Mode::Confirm(_) => self.handle_confirm_key(code),
             Mode::DatePicker(_) => self.handle_datepicker_key(code),
+            Mode::AssistMenu => self.handle_assist_menu_key(code),
+            Mode::Assist(_) => self.handle_assist_key(code),
             Mode::Help => self.mode = Mode::List,
         }
     }
@@ -495,6 +772,7 @@ impl App {
             KeyCode::Char('c') => self.start_commit(),
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('s') => self.toggle_server(),
+            KeyCode::Char('a') => self.open_assist_menu(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
         }
@@ -710,6 +988,169 @@ mod tests {
         assert!(matches!(app.mode, Mode::List), "picker closes on confirm");
         let expected = Date::today().add_days(8).to_iso();
         assert_eq!(app.selected_post().unwrap().date, expected);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The assistant screen for the selected post, as `start_assist` opens it,
+    /// without a model.
+    fn assist_screen(app: &mut App, action: Action) {
+        let post = app.selected_post().unwrap().clone();
+        app.mode = Mode::Assist(AssistState {
+            action,
+            title: post.title,
+            filename: post.filename,
+            path: post.path,
+            id: 7,
+            phase: AssistPhase::Waiting("loading".into()),
+            thinking: String::new(),
+            answer: String::new(),
+            scroll: 0,
+            follow: true,
+            confirm_replace: false,
+        });
+    }
+
+    fn finish(app: &mut App, answer: &str) {
+        app.apply_update(Update::Done {
+            id: 7,
+            answer: answer.into(),
+            summary: "10 tokens".into(),
+        });
+    }
+
+    fn body(app: &App) -> String {
+        post::read_body(&app.selected_post().unwrap().path).unwrap()
+    }
+
+    #[test]
+    fn assist_key_needs_the_feature() {
+        let (dir, mut app) = scratch_app();
+        press(&mut app, 'a');
+        if assist::AVAILABLE {
+            assert!(matches!(app.mode, Mode::AssistMenu));
+            key(&mut app, KeyCode::Esc);
+            assert!(matches!(app.mode, Mode::List));
+        } else {
+            assert!(matches!(app.mode, Mode::List));
+            assert!(app.status.contains("--features biv"), "{}", app.status);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reviewing_an_empty_post_is_refused() {
+        let (dir, mut app) = scratch_app();
+        let post = app.selected_post().unwrap().clone();
+        app.start_assist(Action::Review, post.title, post.filename, post.path);
+        assert!(matches!(app.mode, Mode::List));
+        assert!(app.status.contains("nothing to review"), "{}", app.status);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn updates_stream_into_the_screen_and_stale_ones_are_dropped() {
+        let (dir, mut app) = scratch_app();
+        assist_screen(&mut app, Action::Review);
+        assert!(app.is_assisting());
+        app.apply_update(Update::Loaded("Qwen, Metal".into()));
+        assert_eq!(app.model_info.as_deref(), Some("Qwen, Metal"));
+        app.apply_update(Update::Progress {
+            id: 7,
+            thinking: "hmm".into(),
+            answer: String::new(),
+        });
+        let Mode::Assist(state) = &app.mode else {
+            panic!()
+        };
+        assert_eq!(state.phase, AssistPhase::Thinking);
+        // a cancelled request's last words
+        app.apply_update(Update::Done {
+            id: 6,
+            answer: "old".into(),
+            summary: String::new(),
+        });
+        app.apply_update(Update::Progress {
+            id: 7,
+            thinking: "hmm".into(),
+            answer: "## Summary".into(),
+        });
+        let Mode::Assist(state) = &app.mode else {
+            panic!()
+        };
+        assert_eq!(state.phase, AssistPhase::Writing);
+        assert_eq!(state.answer, "## Summary");
+        finish(&mut app, "## Summary\n\nGood.");
+        assert!(!app.is_assisting());
+        // a review is not written anywhere
+        let before = body(&app);
+        press(&mut app, 'a');
+        assert!(matches!(app.mode, Mode::Assist(_)));
+        assert_eq!(body(&app), before);
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::List));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_plan_is_appended_once_done() {
+        let (dir, mut app) = scratch_app();
+        assist_screen(&mut app, Action::Plan);
+        // not before it is finished
+        press(&mut app, 'a');
+        assert!(matches!(app.mode, Mode::Assist(_)));
+        finish(&mut app, "```markdown\n- intro\n- body\n```");
+        press(&mut app, 'a');
+        assert!(matches!(app.mode, Mode::List));
+        assert!(
+            body(&app).ends_with("<!-- more -->\n\n## Plan\n\n- intro\n- body\n"),
+            "{}",
+            body(&app)
+        );
+        assert_eq!(app.selected_post().unwrap().title, "Hello World");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_draft_replaces_an_empty_body_without_asking() {
+        let (dir, mut app) = scratch_app();
+        assist_screen(&mut app, Action::Draft);
+        finish(&mut app, "Intro.\n\n<!-- more -->\n\n## One\n");
+        press(&mut app, 'a');
+        assert!(matches!(app.mode, Mode::List));
+        assert_eq!(body(&app), "Intro.\n\n<!-- more -->\n\n## One\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_draft_over_existing_text_needs_confirmation() {
+        let (dir, mut app) = scratch_app();
+        let path = app.selected_post().unwrap().path.clone();
+        post::append_to_body(&path, "my notes").unwrap();
+
+        assist_screen(&mut app, Action::Draft);
+        finish(&mut app, "The draft.");
+        press(&mut app, 'a');
+        let Mode::Assist(state) = &app.mode else {
+            panic!()
+        };
+        assert!(state.confirm_replace);
+        press(&mut app, 'n'); // declined: nothing written
+        assert!(body(&app).contains("my notes"));
+        let Mode::Assist(state) = &app.mode else {
+            panic!()
+        };
+        assert!(!state.confirm_replace);
+
+        press(&mut app, 'a');
+        press(&mut app, 'y');
+        assert!(matches!(app.mode, Mode::List));
+        assert_eq!(body(&app), "The draft.\n");
+        assert!(post::read_body(&path).is_ok());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("+++\ntitle = \"Hello World\"")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

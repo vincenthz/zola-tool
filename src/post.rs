@@ -314,24 +314,58 @@ pub fn read_body(path: &Path) -> Result<String> {
     Ok(strip_front_matter(&content).to_string())
 }
 
+/// Append `text` to a post's body, after a blank line, leaving the front
+/// matter and the existing body as they are.
+pub fn append_to_body(path: &Path, text: &str) -> Result<()> {
+    let content = fs::read_to_string(path)?;
+    let mut out = content.trim_end().to_string();
+    out.push_str("\n\n");
+    out.push_str(text.trim());
+    out.push('\n');
+    fs::write(path, out)?;
+    Ok(())
+}
+
+/// Replace a post's body with `body`, keeping its front matter byte for byte.
+pub fn replace_body(path: &Path, body: &str) -> Result<()> {
+    let content = fs::read_to_string(path)?;
+    let mut out = content[..front_matter_len(&content)].to_string();
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(body.trim());
+    out.push('\n');
+    fs::write(path, out)?;
+    Ok(())
+}
+
 /// Return the slice of `content` after the leading front-matter block, or the
 /// whole string if there is none.
 fn strip_front_matter(content: &str) -> &str {
+    content[front_matter_len(content)..].trim_start_matches('\n')
+}
+
+/// The length of the leading `+++`/`---` front-matter block, closing
+/// delimiter line included; 0 if there is none (or it is not terminated).
+fn front_matter_len(content: &str) -> usize {
     let first = content.lines().next().map(str::trim).unwrap_or("");
     let delim = match first {
         "+++" => "+++",
         "---" => "---",
-        _ => return content,
+        _ => return 0,
     };
     let mut offset = 0;
     for (i, line) in content.split_inclusive('\n').enumerate() {
         offset += line.len();
-        // Skip the opening delimiter; return everything past the closing one.
+        // Skip the opening delimiter; stop past the closing one.
         if i > 0 && line.trim_end_matches(['\n', '\r']).trim() == delim {
-            return content[offset..].trim_start_matches('\n');
+            return offset;
         }
     }
-    content
+    0
 }
 
 /// Today's date as `YYYY-MM-DD` (UTC).
@@ -534,6 +568,48 @@ mod tests {
         let posts = discover(&dir).unwrap();
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].title, "Real Post");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn append_to_body_keeps_everything_before() {
+        let dir = scratch();
+        let path = dir.join("p.md");
+        let front = "+++\ntitle = \"x\"\n[taxonomies]\ntags = []\n+++\n";
+        fs::write(&path, format!("{front}\nnotes\n\n\n")).unwrap();
+        append_to_body(&path, "\n## Plan\n\n- a\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{front}\nnotes\n\n## Plan\n\n- a\n")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_body_keeps_front_matter_verbatim() {
+        let dir = scratch();
+        let path = dir.join("p.md");
+        let front = "+++\ntitle   =   \"x\"\ndraft = true\n+++\n";
+        fs::write(&path, format!("{front}\nold body\n<!-- more -->\nmore\n")).unwrap();
+        replace_body(&path, "\nNew intro.\n\n<!-- more -->\n\n## Part\n\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{front}\nNew intro.\n\n<!-- more -->\n\n## Part\n")
+        );
+        assert_eq!(parse_post(&path).unwrap().title, "x");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_body_without_front_matter_writes_the_body() {
+        let dir = scratch();
+        let path = dir.join("p.md");
+        fs::write(&path, "just text\n").unwrap();
+        replace_body(&path, "new").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        // a front matter without its closing line is not one
+        fs::write(&path, "+++\ntitle = \"x\"\n").unwrap();
+        assert_eq!(front_matter_len("+++\ntitle = \"x\"\n"), 0);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

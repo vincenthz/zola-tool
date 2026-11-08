@@ -1,8 +1,11 @@
 //! A small terminal UI for managing the posts of a Zola blog:
 //! list, preview (rendered markdown), create, rename, edit (via $EDITOR),
 //! delete posts in `content/`, and launch a live `zola serve` preview.
+//! Built with the `biv` feature, a local model also reviews, plans or drafts
+//! posts.
 
 mod app;
+mod assist;
 mod date;
 mod git;
 mod markdown;
@@ -46,11 +49,15 @@ fn run() -> Result<()> {
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.should_quit {
         app.poll_server();
+        app.poll_assist();
         terminal.draw(|f| ui::draw(f, app))?;
 
-        // While serving, wake periodically so a server that exits on its own is
-        // noticed; otherwise block until the next key.
-        let event_ready = if app.is_serving() {
+        // While the assistant writes, wake often to show its text as it comes;
+        // while serving, wake periodically so a server that exits on its own
+        // is noticed; otherwise block until the next key.
+        let event_ready = if app.is_assisting() {
+            event::poll(Duration::from_millis(50))?
+        } else if app.is_serving() {
             event::poll(Duration::from_millis(500))?
         } else {
             true
