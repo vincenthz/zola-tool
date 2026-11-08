@@ -8,6 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use crate::assist::{self, Action, Assistant, Update};
 use crate::date::Date;
 use crate::git::{self, GitState};
+use crate::images::Images;
 use crate::post::{self, Post, Result};
 
 /// How many rows a page-up / page-down jumps in the viewer.
@@ -136,6 +137,8 @@ pub struct App {
     assistant: Assistant,
     /// The assistant's model and engine, once loaded.
     pub model_info: Option<String>,
+    /// Inline images in the preview, when the terminal shows them.
+    pub images: Option<Images>,
 }
 
 impl App {
@@ -155,6 +158,7 @@ impl App {
             git_repo,
             assistant: Assistant::default(),
             model_info: None,
+            images: None,
         };
         app.fill_git(&mut posts);
         app.posts = posts;

@@ -10,6 +10,9 @@ on the markdown files in the site's `content/` directory.
   bold/italic/strikethrough, inline code, code blocks, ordered/unordered lists,
   blockquotes, links, horizontal rules and simple tables — with scrolling and a
   scrollbar. Front matter and raw HTML (e.g. `<!-- more -->`) are stripped.
+  **Images** are shown inline on terminals with the kitty graphics protocol,
+  Sixel or iTerm2's protocol (see [below](#inline-images)); elsewhere they
+  appear as `[image: alt]`.
 - **Create** a new draft post from a title — generates a `YYYY-MM-DD-slug.md`
   file pre-filled with the standard Zola front matter.
 - **Rename** a post's file.
@@ -59,6 +62,34 @@ anywhere inside the repo. You can also point it at a specific directory:
 cargo run --release -- /path/to/blog        # blog root
 cargo run --release -- /path/to/blog/content # content dir directly
 ```
+
+## Inline images
+
+The preview shows a post's images below the line they are in, at their natural
+size or scaled down to the width of the preview, with their `[image: alt]` text
+as a caption. They scroll with the text, and show in part when cut by the top
+or bottom of the view. They are drawn by
+[ratatui-image](https://github.com/ratatui/ratatui-image): with the [kitty
+graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (its
+Unicode placeholders) on kitty, Ghostty and other terminals that have it, else
+with Sixel or iTerm2's protocol. PNG, JPEG, GIF (first frame) and WebP are
+shown.
+
+Images are found the way Zola serves them:
+
+| In the markdown | File |
+|-----------------|------|
+| `/images/x.png` | `static/images/x.png` (or `content/images/x.png`, for colocated assets) |
+| `@/blog/x.png`  | `content/blog/x.png` |
+| `x.png`         | next to the post (e.g. in a page bundle), else `static/x.png` |
+
+Remote URLs (`https://…`) are not fetched and stay as text.
+
+The terminal is asked at startup which protocol it has, so a terminal without
+any (or a multiplexer that hides them) keeps the text preview; half-block
+"images" are not used. `ZOLA_TOOL_IMAGES=0` turns images off;
+`ZOLA_TOOL_IMAGES=1` uses the kitty protocol without asking (for a multiplexer
+that passes images through but not the terminal's replies).
 
 ## Writing assistant (biv)
 
@@ -168,9 +199,10 @@ front-matter edits, the calendar date arithmetic (parse/validate, add
 days/months/years with rollover and leap-day clamping, weekday), the date
 picker's navigate-and-apply flow, git repo detection / status classification /
 commit (in a throwaway repo), the markdown renderer (headings, lists, code
-blocks, HTML skipping, wrap counting), and headless rendering of each screen —
-including the preview and calendar — via ratatui's `TestBackend`, and the
-assistant's prompts, output cleaning, apply-to-post edits and screen flow (with
+blocks, HTML skipping, rows kept for images), and headless rendering of each screen —
+including the preview (an image drawn over its rows with kitty placeholders,
+and scrolled part way out) and calendar — via ratatui's `TestBackend`; image
+sizing and path resolution; and the assistant's prompts, output cleaning, apply-to-post edits and screen flow (with
 simulated model updates, so no model is needed).
 
 ```sh

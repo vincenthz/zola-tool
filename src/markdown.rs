@@ -2,7 +2,8 @@
 //! `ratatui` lines, rendering the subset that makes sense in a terminal
 //! (headings, emphasis, inline code, code blocks, lists, blockquotes, links,
 //! rules and simple tables). Anything it can't render (raw HTML, images) is
-//! degraded gracefully rather than shown verbatim.
+//! degraded gracefully rather than shown verbatim; images can be shown by the
+//! caller, through [`render_with`].
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
@@ -15,14 +16,40 @@ const DIM: Color = Color::DarkGray;
 const CODE_FG: Color = Color::Indexed(180);
 const CODE_BG: Color = Color::Indexed(236);
 
+/// How many rows an image takes when shown: its URL to its height, or `None`
+/// to leave only its `[image: alt]` text.
+pub type ImageRows<'a> = dyn FnMut(&str) -> Option<u16> + 'a;
+
+/// Where an image goes in the rendered lines: the blank lines reserved for it
+/// are `line..line + rows`, for the caller to draw it over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageAt {
+    pub url: String,
+    pub line: usize,
+    pub rows: u16,
+}
+
 /// Parse `markdown` and produce styled, unwrapped logical lines.
 pub fn render(markdown: &str) -> Vec<Line<'static>> {
+    render_with(markdown, &mut |_| None).0
+}
+
+/// As [`render`], with blank lines reserved below the line each image is in
+/// (for the images `images` can show; the `[image: alt]` text stays, as a
+/// caption), and where they are.
+pub fn render_with(
+    markdown: &str,
+    images: &mut ImageRows<'_>,
+) -> (Vec<Line<'static>>, Vec<ImageAt>) {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
 
-    let mut r = Renderer::default();
+    let mut r = Renderer {
+        images: Some(images),
+        ..Renderer::default()
+    };
     for event in Parser::new_ext(markdown, opts) {
         r.event(event);
     }
@@ -30,7 +57,7 @@ pub fn render(markdown: &str) -> Vec<Line<'static>> {
 }
 
 #[derive(Default)]
-struct Renderer {
+struct Renderer<'a, 'f> {
     lines: Vec<Line<'static>>,
     cur: Vec<Span<'static>>,
     bold: u32,
@@ -38,6 +65,14 @@ struct Renderer {
     strike: u32,
     link: bool,
     image: bool,
+    /// Sizes images, see [`render_with`].
+    images: Option<&'a mut ImageRows<'f>>,
+    /// The URL of the image being read.
+    image_url: Option<String>,
+    /// Images to reserve rows for once the current line ends.
+    pending_images: Vec<(String, u16)>,
+    /// The images placed so far.
+    placed: Vec<ImageAt>,
     heading: Option<u8>,
     /// One entry per open list; `Some(n)` is the next ordered number.
     list: Vec<Option<u64>>,
@@ -54,7 +89,7 @@ struct Renderer {
     table_rows: Vec<(bool, Vec<String>)>,
 }
 
-impl Renderer {
+impl Renderer<'_, '_> {
     fn event(&mut self, event: Event<'_>) {
         match event {
             Event::Start(tag) => self.start(tag),
@@ -110,8 +145,9 @@ impl Renderer {
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
             Tag::Link { .. } => self.link = true,
-            Tag::Image { .. } => {
+            Tag::Image { dest_url, .. } => {
                 self.image = true;
+                self.image_url = Some(dest_url.into_string());
                 self.push("[image: ".to_string(), Style::default().fg(DIM));
             }
             Tag::Table(_) => {
@@ -159,6 +195,15 @@ impl Renderer {
             TagEnd::Image => {
                 self.push("]".to_string(), Style::default().fg(DIM));
                 self.image = false;
+                let url = self.image_url.take();
+                // not inside table cells, which are plain text
+                if !self.in_cell
+                    && let (Some(url), Some(images)) = (url, self.images.as_mut())
+                    && let Some(rows) = images(&url)
+                    && rows > 0
+                {
+                    self.pending_images.push((url, rows));
+                }
             }
             TagEnd::TableCell => {
                 self.in_cell = false;
@@ -251,6 +296,17 @@ impl Renderer {
     fn newline(&mut self) {
         let spans = std::mem::take(&mut self.cur);
         self.lines.push(Line::from(spans));
+        self.place_images();
+    }
+
+    /// Reserve the rows of the images of the line just ended.
+    fn place_images(&mut self) {
+        for (url, rows) in std::mem::take(&mut self.pending_images) {
+            let line = self.lines.len();
+            self.lines
+                .extend(std::iter::repeat_with(Line::default).take(rows as usize));
+            self.placed.push(ImageAt { url, line, rows });
+        }
     }
 
     /// Flush a partial line without leaving a trailing empty one.
@@ -262,7 +318,14 @@ impl Renderer {
 
     /// Append a blank separator line, collapsing consecutive blanks.
     fn blank(&mut self) {
-        if self.lines.last().map(|l| l.spans.is_empty()) != Some(true) && !self.lines.is_empty() {
+        // an image's rows are blank lines, but not a separator
+        let after_image = self
+            .placed
+            .last()
+            .is_some_and(|image| image.line + image.rows as usize == self.lines.len());
+        if !self.lines.is_empty()
+            && (after_image || self.lines.last().map(|l| l.spans.is_empty()) != Some(true))
+        {
             self.lines.push(Line::default());
         }
     }
@@ -341,9 +404,16 @@ impl Renderer {
         }
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
+    fn finish(mut self) -> (Vec<Line<'static>>, Vec<ImageAt>) {
         self.flush();
-        while self.lines.last().map(|l| l.spans.is_empty()) == Some(true) {
+        self.place_images();
+        // trailing blank lines go, but not those an image is drawn over
+        let keep = self
+            .placed
+            .last()
+            .map_or(0, |image| image.line + image.rows as usize);
+        while self.lines.len() > keep && self.lines.last().map(|l| l.spans.is_empty()) == Some(true)
+        {
             self.lines.pop();
         }
         if self.lines.is_empty() {
@@ -352,7 +422,7 @@ impl Renderer {
                 Style::default().fg(DIM),
             )));
         }
-        self.lines
+        (self.lines, self.placed)
     }
 }
 
@@ -375,53 +445,6 @@ fn heading_color(level: u8) -> Color {
     }
 }
 
-/// Estimate how many terminal rows the logical `lines` occupy once word-wrapped
-/// to `width`. Used to bound scrolling and size the scrollbar; it mirrors
-/// ratatui's word-wrap closely enough for that purpose.
-pub fn visual_row_count(lines: &[Line], width: u16) -> u16 {
-    if width == 0 {
-        return lines.len().min(u16::MAX as usize) as u16;
-    }
-    let w = width as usize;
-    let mut total: usize = 0;
-    for line in lines {
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        total += wrapped_rows(&text, w);
-    }
-    total.min(u16::MAX as usize) as u16
-}
-
-fn wrapped_rows(text: &str, width: usize) -> usize {
-    let mut rows = 1usize;
-    let mut col = 0usize;
-    for word in text.split(' ') {
-        let wl = word.chars().count();
-        if col == 0 {
-            place_first(&mut rows, &mut col, wl, width);
-        } else if col + 1 + wl <= width {
-            col += 1 + wl;
-        } else {
-            rows += 1;
-            place_first(&mut rows, &mut col, wl, width);
-        }
-    }
-    rows
-}
-
-/// Place a word at the start of a line, hard-splitting it if it is wider than
-/// the whole line.
-fn place_first(rows: &mut usize, col: &mut usize, word_len: usize, width: usize) {
-    if word_len <= width {
-        *col = word_len;
-    } else {
-        *rows += (word_len - 1) / width;
-        *col = word_len % width;
-        if *col == 0 {
-            *col = width;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +454,51 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn rows_are_reserved_below_the_line_of_an_image() {
+        let md = "Look: ![a cat](cat.png) here\n\n![remote](https://x/y.png)\n\nafter\n";
+        let mut asked = Vec::new();
+        let (lines, placed) = render_with(md, &mut |url| {
+            asked.push(url.to_string());
+            (url == "cat.png").then_some(2)
+        });
+        assert_eq!(asked, ["cat.png", "https://x/y.png"]);
+        let text = plain(&lines);
+        let caption = text
+            .iter()
+            .position(|l| l.contains("[image: a cat]"))
+            .unwrap();
+        assert_eq!(text[caption], "Look: [image: a cat] here");
+        assert_eq!(
+            placed,
+            [ImageAt {
+                url: "cat.png".into(),
+                line: caption + 1,
+                rows: 2
+            }]
+        );
+        assert_eq!(&text[caption + 1..caption + 3], ["", ""]);
+        // an image that cannot be shown keeps its text only
+        assert!(text.contains(&"[image: remote]".to_string()));
+        assert_eq!(text.last().unwrap(), "after");
+        // plain render: the same text, no rows reserved
+        assert_eq!(plain(&render(md)).len(), text.len() - 2);
+    }
+
+    #[test]
+    fn an_image_at_the_end_keeps_its_rows() {
+        let (lines, placed) = render_with("![x](x.png)\n", &mut |_| Some(3));
+        assert_eq!(placed[0].line, 1);
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn images_in_table_cells_stay_text() {
+        let md = "| a |\n|---|\n| ![x](x.png) |\n";
+        let (_, placed) = render_with(md, &mut |_| Some(1));
+        assert!(placed.is_empty());
     }
 
     #[test]
@@ -485,13 +553,5 @@ mod tests {
         assert!(text.iter().all(|l| !l.contains("more")));
         assert!(text.iter().any(|l| l == "before"));
         assert!(text.iter().any(|l| l == "after"));
-    }
-
-    #[test]
-    fn wrapped_rows_counts_wrapping() {
-        assert_eq!(wrapped_rows("", 10), 1);
-        assert_eq!(wrapped_rows("short", 10), 1);
-        assert_eq!(wrapped_rows("one two three four", 8), 3); // "one two" / "three" / "four"
-        assert_eq!(wrapped_rows("abcdefghij", 5), 2); // hard split
     }
 }

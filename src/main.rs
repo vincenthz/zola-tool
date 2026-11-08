@@ -1,6 +1,8 @@
 //! A small terminal UI for managing the posts of a Zola blog:
 //! list, preview (rendered markdown), create, rename, edit (via $EDITOR),
 //! delete posts in `content/`, and launch a live `zola serve` preview.
+//! Images show in the preview on terminals with the kitty graphics protocol
+//! (or Sixel, or iTerm2's).
 //! Built with the `biv` feature, a local model also reviews, plans or drafts
 //! posts.
 
@@ -8,6 +10,7 @@ mod app;
 mod assist;
 mod date;
 mod git;
+mod images;
 mod markdown;
 mod post;
 mod ui;
@@ -39,6 +42,8 @@ fn run() -> Result<()> {
     let mut app = App::new(content_dir)?;
 
     let mut terminal = ratatui::init();
+    // before any event is read: the terminal's answer comes on stdin
+    app.images = images::detect();
     let result = event_loop(&mut terminal, &mut app);
     ratatui::restore();
     // Tear down any `zola serve` we started so it does not outlive the tool.
@@ -76,7 +81,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(str::to_string);
-            match edit_in_external_editor(terminal, &path) {
+            let edited = edit_in_external_editor(terminal, &path);
+            // the screen switch may have dropped the images: send them again
+            if let Some(images) = &mut app.images {
+                images.forget();
+            }
+            match edited {
                 Ok(()) => app.status = format!("edited {}", keep.as_deref().unwrap_or("post")),
                 Err(e) => app.status = format!("editor failed: {e}"),
             }

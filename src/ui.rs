@@ -3,7 +3,7 @@
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -17,6 +17,8 @@ use crate::assist;
 use crate::date::{self, Date};
 use crate::git::GitState;
 use crate::markdown;
+use crate::post;
+use ratatui_image::sliced::SignedPosition;
 
 const ACCENT: Color = Color::Cyan;
 
@@ -55,7 +57,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_view(frame: &mut Frame, app: &mut App) {
-    let Mode::View(view) = &mut app.mode else {
+    let App {
+        mode,
+        images,
+        content_dir,
+        ..
+    } = app;
+    let Mode::View(view) = mode else {
         return;
     };
 
@@ -68,7 +76,28 @@ fn draw_view(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
-    let lines = markdown::render(&view.body);
+    // inside the body's borders
+    let inner = Rect {
+        x: chunks[1].x + 1,
+        y: chunks[1].y + 1,
+        width: chunks[1].width.saturating_sub(2),
+        height: chunks[1].height.saturating_sub(2),
+    };
+    // images at most as wide as the text, and short enough to leave room for
+    // their caption on screen
+    let max = Size::new(inner.width, inner.height.saturating_sub(2).max(1));
+    let (lines, placed) = match images {
+        Some(images) => markdown::render_with(&view.body, &mut |url| {
+            let path = post::resolve_asset(url, &view.path, content_dir)?;
+            images.size(&path, max).map(|size| size.height)
+        }),
+        None => (markdown::render(&view.body), Vec::new()),
+    };
+    // the row of the wrapped text each image starts at
+    let tops: Vec<u16> = placed
+        .iter()
+        .map(|image| wrapped_rows(&lines[..image.line], inner.width))
+        .collect();
     let percent = draw_scrolled(
         frame,
         chunks[1],
@@ -77,6 +106,19 @@ fn draw_view(frame: &mut Frame, app: &mut App) {
         false,
         Block::default().borders(Borders::ALL).title(" Preview "),
     );
+    // each image over the blank rows kept for it, cut where the view ends
+    if let Some(images) = images {
+        for (image, top) in placed.iter().zip(tops) {
+            let y = i32::from(top) - i32::from(view.scroll);
+            if y >= i32::from(inner.height) || y + i32::from(image.rows) <= 0 {
+                continue;
+            }
+            if let Some(path) = post::resolve_asset(&image.url, &view.path, content_dir) {
+                let position = SignedPosition::from((0, y as i16));
+                images.render(&path, max, inner, position, frame.buffer_mut());
+            }
+        }
+    }
 
     // Header: title + filename + scroll position.
     let header = Line::from(vec![
@@ -128,7 +170,7 @@ fn draw_scrolled(
 ) -> u16 {
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2);
-    let total = markdown::visual_row_count(&lines, inner_w);
+    let total = wrapped_rows(&lines, inner_w);
     let max_scroll = total.saturating_sub(inner_h);
     if follow || *scroll > max_scroll {
         *scroll = max_scroll;
@@ -157,6 +199,18 @@ fn draw_scrolled(
         &mut sb_state,
     );
     percent
+}
+
+/// The rows `lines` take once word-wrapped to `width`, exactly as
+/// [`draw_scrolled`] wraps them.
+fn wrapped_rows(lines: &[Line<'static>], width: u16) -> u16 {
+    if width == 0 {
+        return lines.len().min(u16::MAX as usize) as u16;
+    }
+    let rows = Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    rows.min(u16::MAX as usize) as u16
 }
 
 /// The assistant's screen: its answer streaming in, rendered as markdown.
@@ -836,6 +890,87 @@ mod tests {
             state.confirm_replace = true;
         }
         assert!(render(&mut app).contains("Replace the body of"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The rows of the frame with kitty image placeholder cells.
+    fn image_rows(terminal: &Terminal<TestBackend>) -> Vec<u16> {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .filter(|&y| {
+                (0..buf.area.width)
+                    .any(|x| buf.cell((x, y)).unwrap().symbol().contains('\u{10EEEE}'))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn preview_draws_images_over_their_rows_and_scrolls_them() {
+        use crate::app::ViewState;
+        use crate::images::{Images, tests::kitty_picker};
+        let (dir, mut app) = scratch_with_post();
+        // 200x100 px at 10x20 px cells: 20 columns by 5 rows
+        image::RgbImage::new(200, 100)
+            .save(dir.join("cat.png"))
+            .unwrap();
+        app.images = Some(Images::new(kitty_picker()));
+        let post = app.selected_post().unwrap().clone();
+        // a paragraph long enough to wrap, so the image's row depends on wrapping
+        let intro = "word ".repeat(60);
+        app.mode = Mode::View(ViewState {
+            title: post.title,
+            filename: post.filename,
+            path: post.path,
+            body: format!(
+                "{intro}\n\n![a cat](cat.png)\n\nOutro\n\n{}",
+                "more\n\n".repeat(20)
+            ),
+            scroll: 0,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let row = |terminal: &Terminal<TestBackend>, y: u16| -> String {
+            let buf = terminal.backend().buffer();
+            (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        };
+        // the body's top border is row 3: the intro wraps on rows 4-7, then a
+        // blank row and the caption
+        assert!(row(&terminal, 7).contains("word") && !row(&terminal, 8).contains("word"));
+        assert!(row(&terminal, 9).contains("[image: a cat]"));
+        assert_eq!(
+            image_rows(&terminal),
+            [10, 11, 12, 13, 14],
+            "20x5, below the caption"
+        );
+        assert_eq!(row(&terminal, 10).matches('\u{10EEEE}').count(), 20);
+        assert!(
+            (10..15).all(|y| !row(&terminal, y).contains("word")),
+            "no text under it"
+        );
+        assert!(
+            row(&terminal, 16).contains("Outro"),
+            "a blank row, then the text"
+        );
+
+        // scrolled by 8: its top 2 rows are above the view, the other 3 at the top
+        if let Mode::View(v) = &mut app.mode {
+            v.scroll = 8;
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(image_rows(&terminal), [4, 5, 6]);
+        assert!(row(&terminal, 8).contains("Outro"));
+
+        // without images, the text is all there is
+        app.images = None;
+        if let Mode::View(v) = &mut app.mode {
+            v.scroll = 0;
+        }
+        let text = render(&mut app);
+        assert!(text.contains("[image: a cat]"));
+        assert!(!text.contains('\u{10EEEE}'));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -314,6 +314,50 @@ pub fn read_body(path: &Path) -> Result<String> {
     Ok(strip_front_matter(&content).to_string())
 }
 
+/// The local file an image reference of the post at `post` points to, the
+/// way Zola serves it: `/x.png` from `static/` (or `content/`, for colocated
+/// assets), `@/x.png` from `content/`, and a relative path from the post's
+/// directory (or `static/`). Remote URLs and missing files give `None`.
+pub fn resolve_asset(url: &str, post: &Path, content_dir: &Path) -> Option<PathBuf> {
+    let url = url.trim();
+    if url.is_empty() || url.contains("://") || url.starts_with("//") || url.starts_with("data:") {
+        return None;
+    }
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let path = percent_decode(path);
+    let root = content_dir.parent().unwrap_or(content_dir);
+    let static_dir = root.join("static");
+    let candidates: Vec<PathBuf> = if let Some(rest) = path.strip_prefix("@/") {
+        vec![content_dir.join(rest)]
+    } else if let Some(rest) = path.strip_prefix('/') {
+        vec![static_dir.join(rest), content_dir.join(rest)]
+    } else {
+        let dir = post.parent().unwrap_or(content_dir);
+        vec![dir.join(&path), static_dir.join(&path)]
+    };
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// `%XX` escapes decoded (as URLs in markdown often have `%20` for spaces).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(hex) = s.get(i + 1..i + 3)
+            && let Ok(b) = u8::from_str_radix(hex, 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
 /// Append `text` to a post's body, after a blank line, leaving the front
 /// matter and the existing body as they are.
 pub fn append_to_body(path: &Path, text: &str) -> Result<()> {
@@ -569,6 +613,55 @@ mod tests {
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].title, "Real Post");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn image_references_resolve_like_zola() {
+        let root = scratch();
+        let content = root.join("content");
+        let bundle = content.join("trip");
+        fs::create_dir_all(root.join("static/images")).unwrap();
+        fs::create_dir_all(&bundle).unwrap();
+        for f in [
+            "static/images/a b.png",
+            "static/logo.png",
+            "content/trip/photo.jpg",
+            "content/shared.png",
+        ] {
+            fs::write(root.join(f), b"x").unwrap();
+        }
+        let flat = content.join("2026-01-01-post.md");
+        let in_bundle = bundle.join("index.md");
+        let r = |url: &str, post: &Path| resolve_asset(url, post, &content);
+
+        assert_eq!(
+            r("/images/a%20b.png", &flat),
+            Some(root.join("static/images/a b.png"))
+        );
+        assert_eq!(
+            r("/logo.png?v=2#top", &flat),
+            Some(root.join("static/logo.png"))
+        );
+        // an absolute path to a colocated asset
+        assert_eq!(
+            r("/trip/photo.jpg", &flat),
+            Some(content.join("trip/photo.jpg"))
+        );
+        assert_eq!(r("@/shared.png", &flat), Some(content.join("shared.png")));
+        // relative: next to the post, else in static/
+        assert_eq!(r("photo.jpg", &in_bundle), Some(bundle.join("photo.jpg")));
+        assert_eq!(r("shared.png", &flat), Some(content.join("shared.png")));
+        assert_eq!(
+            r("logo.png", &in_bundle),
+            Some(root.join("static/logo.png"))
+        );
+        // remote, inline data and missing files are not shown
+        assert_eq!(r("https://example.com/x.png", &flat), None);
+        assert_eq!(r("//cdn.example.com/x.png", &flat), None);
+        assert_eq!(r("data:image/png;base64,AAAA", &flat), None);
+        assert_eq!(r("/nope.png", &flat), None);
+        assert_eq!(r("", &flat), None);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

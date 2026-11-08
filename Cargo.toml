@@ -14,8 +14,13 @@ path = "src/main.rs"
 biv = ["dep:biv", "dep:biv-cli", "dep:rayon"]
 
 [dependencies]
-ratatui = "0.30"
+# line_count: where wrapped text puts the images of the preview
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 pulldown-cmark = { version = "0.13", default-features = false }
+# images in the preview: drawn with the kitty, Sixel or iTerm2 protocol
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
+# the formats the preview decodes
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # the inference engine, and its GGUF / Hugging Face cache helpers
 biv = { git = "https://github.com/vincenthz/biv", optional = true }
 biv-cli = { git = "https://github.com/vincenthz/biv", optional = true }
